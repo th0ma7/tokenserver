@@ -6,6 +6,7 @@
 import sys
 import re
 import fnmatch
+import socket
 
 
 runner = sys.argv[0]
@@ -14,11 +15,22 @@ runner = sys.argv[0]
 import logging
 from collections import defaultdict
 
+from urllib3.connection import HTTPConnection
+
 from tokenserver.assignment import INodeAssignment
 
 from mozsvc.config import get_configurator
 from mozsvc.plugin import load_and_register, load_from_settings
 
+
+HTTPConnection.default_socket_options = (
+    HTTPConnection.default_socket_options + [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.SOL_TCP, socket.TCP_KEEPIDLE, 120),
+        (socket.SOL_TCP, socket.TCP_KEEPINTVL, 30),
+        (socket.SOL_TCP, socket.TCP_KEEPCNT, 6)
+    ]
+)
 
 logger = logging.getLogger('tokenserver')
 

@@ -338,6 +338,7 @@ class SQLNodeAssignment(object):
         if self._migration_percentage_cache_ttl > time.time():
             return self.migrate_new_user_percentage
         default = self.migrate_new_user_percentage or 0
+        res = None
         try:
             res = self._safe_execute(
                 _GET_DYNAMIC_SETTING,
@@ -352,6 +353,9 @@ class SQLNodeAssignment(object):
                 "Could not get migration percent \"{}\" using default: {}"
                 .format(ex, default)
             )
+        finally:
+            if res:
+                res.close()
         return self.migrate_new_user_percentage
 
     def should_allocate_to_spanner(self, email):
@@ -383,6 +387,7 @@ class SQLNodeAssignment(object):
             'timestamp': timestamp
         }
         res = self._safe_execute(_CREATE_USER_RECORD, **params)
+        res.close()
         return {
             'email': email,
             'uid': res.lastrowid,

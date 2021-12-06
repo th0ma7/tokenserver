@@ -84,11 +84,12 @@ def _unauthorized(status_message='error', **kw):
     return json_error(401, status_message, **kw)
 
 
-def _invalid_client_state(reason, **kw):
+def _invalid_client_state(request, reason, **kw):
     kw.setdefault('location', 'header')
     kw.setdefault('name', 'X-Client-State')
     description = 'Unacceptable client-state value %s' % (reason,)
     kw.setdefault('description', description)
+    request.metrics['cause'] = description
     return _unauthorized('invalid-client-state', **kw)
 
 
@@ -115,10 +116,12 @@ def valid_authorization(request, **kwargs):
     """
     authz = request.headers.get('Authorization')
     if authz is None:
+        request.metrics['cause'] = 'missing authorization header'
         raise _unauthorized()
 
     authz = authz.split(None, 1)
     if len(authz) != 2:
+        request.metrics['cause'] = 'invalid authorization header'
         raise _unauthorized()
     name, token = authz
 
@@ -127,6 +130,7 @@ def valid_authorization(request, **kwargs):
     elif name.lower() == 'bearer':
         _validate_oauth_token(request, token)
     else:
+        request.metrics['cause'] = 'unsupported authorization type: %s' % name.lower()
         resp = _unauthorized(description='Unsupported')
         resp.www_authenticate = ('BrowserID', {})
         raise resp
@@ -232,6 +236,7 @@ def _validate_oauth_token(request, token):
         if isinstance(e, ConnectionError):
             request.metrics['token.oauth.connection_error'] = 1
             raise json_error(503, description="Resource is not available")
+        request.metrics['cause'] = 'invalid credentials (OAuth token)'
         raise _unauthorized("invalid-credentials")
 
     request.metrics['token.oauth.verify_success'] = 1
@@ -255,9 +260,12 @@ def _validate_oauth_token(request, token):
             # If they don't match, the client is definitely confused.
             if 'X-Client-State' in request.headers:
                 if request.headers['X-Client-State'] != client_state:
+                    request.metrics['cause'] = 'invalid client state'
                     raise _unauthorized("invalid-client-state")
             request.validated['client-state'] = client_state
         except (IndexError, ValueError):
+            logger.exception("Unexpected client state verification error")
+            request.metrics['cause'] = 'invalid credentials (client-state)'
             raise _unauthorized("invalid-credentials")
 
 
@@ -354,9 +362,11 @@ def return_token(request):
     else:
         generation = idp_claims.get('fxa-generation', 0)
         if not isinstance(generation, (int, long)):
+            request.metrics['cause'] = 'invalid FxA client state generation'
             raise _unauthorized("invalid-generation")
         keys_changed_at = idp_claims.get('fxa-keysChangedAt', 0)
         if not isinstance(keys_changed_at, (int, long)):
+            request.metrics['cause'] = 'invalid FxA credentials (key change timestamp)'
             raise _unauthorized("invalid-credentials",
                                 description="invalid keysChangedAt")
 
@@ -371,6 +381,7 @@ def return_token(request):
     if not user:
         allowed = settings.get('tokenserver.allow_new_users', True)
         if not allowed:
+            request.metrics['cause'] = 'new users not allowed'
             raise _unauthorized('new-users-disabled')
         with metrics_timer('tokenserver.backend.allocate_user', request):
             user = backend.allocate_user(service, email, generation,
@@ -410,6 +421,7 @@ def return_token(request):
         # written the new value of `generation`. The best we can do
         # here is enforce that `keys_changed_at` <= `generation`.
         if generation > 0 and generation < keys_changed_at:
+            request.metrics['cause'] = 'invalid key change timestamp'
             raise _unauthorized('invalid-keysChangedAt')
         if generation == 0 and keys_changed_at > user['generation']:
             updates['generation'] = keys_changed_at
@@ -417,20 +429,20 @@ def return_token(request):
     if client_state != user['client_state']:
         # Don't revert from some-client-state to no-client-state.
         if not client_state:
-            raise _invalid_client_state('empty string')
+            raise _invalid_client_state(request, 'empty string')
         # Don't revert to a previous client-state.
         if client_state in user['old_client_states']:
-            raise _invalid_client_state('stale value')
+            raise _invalid_client_state(request, 'stale value')
         # If we have a generation number, then
         # don't update client-state without a change in generation number.
         if generation > 0 and 'generation' not in updates:
             raise _invalid_client_state(
-                'new value with no generation change')
+                request, 'new value with no generation change')
         # If the IdP has been sending keys_changed_at timestamps, then
         # don't update client-state without a change in keys_changed_at.
         if user['keys_changed_at'] > 0 and 'keys_changed_at' not in updates:
             raise _invalid_client_state(
-                'new value with no keys_changed_at change')
+                request, 'new value with no keys_changed_at change')
         updates['client_state'] = client_state
     if updates:
         with metrics_timer('tokenserver.backend.update_user', request):
@@ -439,6 +451,7 @@ def return_token(request):
     # Error out if this client provided a generation number, but it is behind
     # the generation number of some previously-seen client.
     if generation > 0 and user['generation'] > generation:
+        request.metrics['cause'] = 'invalid client state generation'
         raise _unauthorized("invalid-generation")
 
     # Error out if we previously saw a keys_changed_at for this user, but they
@@ -447,6 +460,7 @@ def return_token(request):
     # stops (because we can't generate a proper `fxa_kid` in this case).
     if user['keys_changed_at'] > 0:
         if user['keys_changed_at'] > keys_changed_at:
+            request.metrics['cause'] = 'invalid user key change timestamp'
             raise _unauthorized("invalid-keysChangedAt")
 
     secrets = settings['tokenserver.secrets']
